@@ -1,0 +1,13 @@
+[package]
+name = "zeroconf-async"
+version = "0.1.0"
+authors = ["Robert Klotzner <robert.klotzner@gmx.at>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+zeroconf = "0.6.2"
+avahi-sys = {version = "0.10.0", path="../avahi-sys"}
+async-io = "1.2.0"
+libc = "0.2.80"
