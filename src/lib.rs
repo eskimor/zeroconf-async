@@ -10,6 +10,7 @@ use std::{
     task::Context,
     task::Poll as TaskPoll,
     task::Waker,
+    time::Instant,
 };
 
 use futures::task::noop_waker;
@@ -20,21 +21,28 @@ use avahi_sys::{
     AvahiWatchEvent_AVAHI_WATCH_OUT,
 };
 
-use async_io::Async;
+use avahi_sys as avahi;
+
+use async_io::{Async, Timer};
 
 ///
 /// # Safety:
 ///
-/// The C API offers pointers pointing into values hold by this struct. Once this struct gets
-/// dropped those values will be freed. You must therefore ensure that the users of the C API do
-/// not outlive this struct. It is also assumed that once a watch or a timeout is freed
-/// (`timeout_free` and `watch_free` functions in the AvahiPoll struct) by the C
-/// API, it will no longer be accessed and it is thus safe to free it.
+/// The C API offers pointers pointing into values hold by this struct. Once
+/// this struct gets dropped those values will be freed. You must therefore
+/// ensure that the users of the C API do not outlive this struct. It is also
+/// assumed that once a watch or a timeout is freed (`timeout_free` and
+/// `watch_free` functions in the AvahiPoll struct) by the C API, it will no
+/// longer be accessed and it is thus safe to free it.
 pub struct Poll {
     api: AvahiPoll,
     /// Filedescriptors we are supposed to watch:
+    ///
+    /// indexed by file descriptor so we can look it up based on user `Watch`es.
     watches: HashMap<RawFd, WatchedFd>,
-    timeouts: Vec<*mut Timeout>,
+
+    /// One shot timers, will be removed once they fired.
+    timeouts: Vec<Box<Timeout>>,
     /// Waker for waking up the poll.
     /// Will be triggered anytime the set of interesting watches changes.
     waker: Waker,
@@ -50,7 +58,8 @@ struct WatchedFd {
     revents: AvahiWatchEvent,
     /// All the clients interested in this file descriptor.
     ///
-    /// We need to box these Watches because the C side will keep pointers to those values.
+    /// We need to box these Watches because the C side will keep pointers to
+    /// those values.
     clients: Vec<Box<Watch>>,
 }
 
@@ -75,15 +84,53 @@ pub struct Watch {
 pub struct Timeout {
     callback: AvahiTimeoutCallback,
     userdata: *mut ::libc::c_void,
-    fire_time: timeval,
+    timer: Timer,
     dead: bool,
 }
 
+impl Future for Timeout {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
+        if self.dead {
+            return TaskPoll::Ready(());
+        }
+        match (Pin::new(&mut self.timer)).poll(cx) {
+            TaskPoll::Ready(_) => {
+                self.call_client();
+                self.dead = true;
+                TaskPoll::Ready(())
+            }
+            TaskPoll::Pending => TaskPoll::Pending,
+        }
+    }
+}
+
+impl Timeout {
+    fn call_client(&mut self) {
+        let callback = self.callback.expect("Callback must not be null");
+        let p: *mut Timeout = &mut *self;
+        // Assuming C code does not mess it up, this should be safe:
+        unsafe {
+            callback(p as *mut AvahiTimeout, self.userdata);
+        }
+    }
+}
+
 impl WatchedFd {
-    /// Check filedescriptor for new events and set revents accordingly.
+    /// Cleanup any dead clients.
+    /// 
+    /// Returns: true if this watch still has clients afterwards, false if it should be removed.
+    fn cleanup(&mut self) -> bool {
+        self.clients.retain(|c| !(*c).dead);
+        !self.clients.is_empty()
+    }
+
+    /// Check filedescriptor for new events, set revents accordingly and call
+    /// callbacks.
     ///
     /// Returns: The found events (zero in case fd was not ready):
-    fn do_poll(&mut self, cx: &mut Context<'_>) -> AvahiWatchEvent {
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> AvahiWatchEvent {
         let asked_events = self
             .clients
             .iter()
@@ -99,6 +146,9 @@ impl WatchedFd {
                 revents | get_revents(&self.fd.poll_writable(cx), AvahiWatchEvent_AVAHI_WATCH_OUT);
         }
         self.revents = revents;
+
+        self.call_clients();
+
         revents
     }
 
@@ -121,7 +171,7 @@ fn get_revents(p: &TaskPoll<io::Result<()>>, e: AvahiWatchEvent) -> AvahiWatchEv
         TaskPoll::Ready(Err(err)) => {
             log::warn!("Checking for event {:?} failed with: {}", e, err);
             AvahiWatchEvent_AVAHI_WATCH_ERR
-        },
+        }
         TaskPoll::Pending => 0,
     }
 }
@@ -137,7 +187,7 @@ impl Watch {
                 callback(
                     p as *mut AvahiWatch,
                     self.fd,
-                    revents & self.events,
+                    revents,
                     self.userdata,
                 );
             }
@@ -152,8 +202,7 @@ impl Poll {
             userdata: std::ptr::null_mut(),
             watch_new: Some(watch_new),
             watch_update: Some(watch_update),
-            // watch_get_events: Some(watch_get_events),
-            watch_get_events: None,
+            watch_get_events: Some(watch_get_events),
             watch_free: Some(watch_free),
             timeout_new: Some(timeout_new),
             timeout_update: Some(timeout_update),
@@ -176,6 +225,12 @@ impl Poll {
         assert_ne!(p, std::ptr::null_mut());
         p as *mut AvahiPoll
     }
+
+    /// Remove dead watches and timers.
+    fn cleanup_dead(&mut self) {
+        self.watches.retain(|_, v| v.cleanup());
+        self.timeouts.retain(|t| !t.dead);
+    }
 }
 
 impl Future for Poll {
@@ -183,21 +238,18 @@ impl Future for Poll {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
         self.waker = cx.waker().clone();
+
+        self.cleanup_dead();
+
         for wfd in self.watches.values_mut() {
-            wfd.do_poll(cx);
-            wfd.call_clients();
+            wfd.poll(cx);
+        }
+
+        for t in &mut self.timeouts {
+            // We don't care, we always return `Pending` and will wait for more events.
+            let _ = Pin::new(&mut *t).poll(cx);
         }
         TaskPoll::Pending
-    }
-}
-
-impl Drop for Poll {
-    fn drop(&mut self) {
-        unsafe {
-            for t in &self.timeouts {
-                Box::from_raw(*t);
-            }
-        }
     }
 }
 
@@ -276,28 +328,32 @@ unsafe extern "C" fn timeout_new(
     callback: AvahiTimeoutCallback,
     userdata: *mut ::libc::c_void,
 ) -> *mut AvahiTimeout {
-    // TODO: Apart from properly implementing this: all waker!
     assert_ne!(api, std::ptr::null());
-    let b_timer = Box::new(Timeout {
+    let mut b_timer = Box::new(Timeout {
         callback,
         userdata,
-        fire_time: *tv,
+        timer: Timer::at(timeval_to_instant(
+            tv.as_ref().expect("Passed timeval must not be null!"),
+        )),
         dead: false,
     });
-    let timer = Box::into_raw(b_timer);
+    let timer: *mut Timeout = &mut *b_timer;
     let s: &mut Poll = (*api)
         .userdata
         .cast::<Poll>()
         .as_mut()
         .expect("Userdata should have been initialized and must not be null.");
-    s.timeouts.push(timer);
+    s.timeouts.push(b_timer);
+    s.waker.clone().wake();
     timer as *mut AvahiTimeout
 }
 
 unsafe extern "C" fn timeout_update(arg1: *mut AvahiTimeout, tv: *const timeval) {
-    // TODO: Apart from properly implementing this: all waker!
+    // TODO: HANDLE DEAD TIMERS!
     let timeout = arg1 as *mut Timeout;
-    (*timeout).fire_time = *tv;
+    (*timeout).timer.set_at(timeval_to_instant(
+        tv.as_ref().expect("Passed timeval must not be null!"),
+    ));
 }
 
 unsafe extern "C" fn timeout_free(t: *mut AvahiTimeout) {
@@ -305,10 +361,43 @@ unsafe extern "C" fn timeout_free(t: *mut AvahiTimeout) {
     (*timeout).dead = true;
 }
 
+/// Get a Rust `Instant` from a timeval as used on the C side.
+///
+/// We need this for briding the avahi poll API for timers with async-io timers,
+/// which accept `Instants`.
+fn timeval_to_instant(val: &avahi::timeval) -> Instant {
+    timespec_to_instant(&timeval_to_timespec(val))
+}
+
+fn timespec_to_instant(spec: &avahi::timespec) -> Instant {
+    // This is safe, because as of this writing an `Instant` is a libc::timespec under the
+    // hood.
+    //
+    // This might change, we therefore have a test case in the test suit of this library which
+    // should catch if this ever changes. Combined with the size check of `transmute` this should
+    // be reasonably safe.
+    unsafe { std::mem::transmute::<avahi::timespec, Instant>(*spec) }
+}
+fn timeval_to_timespec(val: &avahi::timeval) -> avahi::timespec {
+    avahi::timespec {
+        tv_sec: val.tv_sec,
+        tv_nsec: val.tv_usec * 1000,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::timeval_to_instant;
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn check_timeval_to_instant_correctness() {
+        let t = avahi_sys::timeval {
+            tv_sec: 1_576_800_000,
+            tv_usec: 314_159,
+        };
+        let instant = timeval_to_instant(&t);
+        assert_eq!(
+            format!("{:?}", instant),
+            "Instant { tv_sec: 1576800000, tv_nsec: 314159000 }"
+        );
     }
 }
